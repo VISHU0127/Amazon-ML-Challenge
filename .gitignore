@@ -1,0 +1,24 @@
+# Data files (too large for git)
+dataset/
+*.tsv
+
+# Artifacts (models, feature matrices — regenerable)
+artifacts/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Kilo
+.kilo/
