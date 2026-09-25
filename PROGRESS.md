@@ -182,5 +182,71 @@ Top: limited(6318), private(5644), llc(5222), inc(3354), ltd(2484), pvt(1704), s
 - In Stage 4, `scale_pos_weight` will be explicitly set to `(len(y) - sum(y)) / sum(y) ≈ 4.05` to balance the ~19.8% positive rate so class imbalance does not compound with F0.5's precision bias.
 - Probability calibration (isotonic regression / Platt scaling) will be fitted on the validation split.
 
+---
+
+## Stage 3 Follow-Up Diagnostics — 2025-09-25
+
+### Issue 1: `country_exact_match` Always 1.0 (Cross-Country Analysis)
+
+**Finding**: Across all 7,638,365 ground-truth match pairs in training data, there are **exactly 0 cross-country true matches**. All pairs are strictly (US, US) = 4,578,522 or (India, India) = 3,059,843.
+
+**Root Cause**: The cross-country fallback in `blocking.py` (lines 253-257) is correctly wired, and `build_feature_matrices.py` correctly invokes blocking per country partition (line 144-146, skips if `c_norm not in engines`). The fallback produces zero candidates simply because there are zero cross-country true matches to find in the training data — not because the fallback path is broken.
+
+**Implication**: `country_exact_match` is a constant feature (always 1.0) in the training matrix. The model will have zero training exposure to `country_exact_match=0` pairs. However, this is a **known limitation, not a bug**, because:
+1. For France test data, both S1 and S2/S3 targets will share the same normalized country string `"france"`, so the same-country partition path applies normally.
+2. The realistic failure mode for France is not cross-country matching — it's unseen suffix/abbreviation patterns, which the multilingual embeddings and open-vocabulary normalization are designed to handle.
+3. `country_exact_match` will remain as a feature (harmless as a constant) — the model will learn to ignore it. It could become useful if future data introduces cross-country pairs.
+
+**Action**: Documented as known limitation. No code change needed.
+
+### Issue 2: Missed True Match Pattern Analysis (Recall Gap Investigation)
+
+**Setup**: Analyzed 5,000 validation S1 entities (same sample as `build_feature_matrices.py`) against the sampled target pool, comparing top-60 vs top-200 blocking candidates.
+
+**Recall Summary**:
+| Metric | Value |
+|--------|-------|
+| Total true matches checked | 17,245 |
+| Found in top-60 | 16,600 (96.26%) |
+| Missed in top-60 | 645 (3.74%) |
+| — Recoverable in top-200 | 152 (rank mean=126, median=127, range 61–195) |
+| — Not in top-200 either | 493 (truly invisible) |
+
+**Pattern Analysis of 645 Missed Pairs**:
+
+- **By Source**: S2 = 312, S3 = 333 — balanced, not a source-specific issue.
+- **By Country**: India = 414 (64%), US = 231 (36%) — India overrepresented (expected given more ambiguous names).
+- **Strategy Hit Rate on Missed Pairs** (had shared blocking keys but were outranked):
+  - `name_token`: 186/645 (28.8%)
+  - `soundex`: 234/645 (36.3%)
+  - `prefix3`: 279/645 (43.3%)
+  - `addr_token`: 480/645 (74.4%)
+- **Zero shared name tokens** (invisible to name strategy entirely): **459/645 (71.2%)**
+- **JW similarity of missed pairs**: Mean 0.637, Median 0.705, Min 0.000, Max 1.000
+
+**Root Cause**: The dominant failure mode is **very short or very common normalized names** after suffix stripping. Examples:
+- "Om Trading Private Limited" → normalized to `"om"` (single token, matches thousands of targets)
+- "Value" → normalized to `"value"` (single common token)
+- "High Tech LLP" → normalized to `"high"` (single common word)
+- "New Delhi Consulting" → normalized to `"new delhi"` (common place name tokens)
+- "Consulting Solutions Private Limited" → normalized to `""` (empty after suffix stripping!)
+
+These entities have name tokens that appear in thousands of target records, causing the IDF-weighted scoring to be flooded by distractors. The target (often with empty address) gets outranked.
+
+**Key Insight**: Raising the cap further won't help for 493/645 missed pairs — they aren't even in top-200. The issue is **not cap size or fusion ranking** but rather that suffix stripping produces names too short/generic to be discriminative in the inverted index. These represent ~2.86% of true matches — a hard ceiling.
+
+**Mitigation**: The LightGBM classifier in Stage 4 will handle these edge cases via the `name_embedding_cosine` feature, which captures semantic similarity even when lexical overlap is low. The `build_feature_matrices.py` already injects these missed true positives into the training matrix (lines 160-163: true matches not in candidates are added with blocking_score=0, rank=61), so the model sees them as hard positives with low blocking scores.
+
+**Action**: Documented as understood limitation. No blocking code change — the ~96.26% blocking recall is the practical ceiling given the data's noise characteristics. The remaining ~3.74% are genuinely hard cases that would require fundamentally different blocking strategies (e.g., embedding-based blocking, which is too expensive for this pipeline).
+
+### Issue 3: Embedding Caching Confirmation
+
+**Confirmed**: Embeddings in `build_feature_matrices.py` are computed from **per-entity cached embeddings**:
+1. All unique normalized name strings and address strings are collected into sets (lines 187-200).
+2. `SentenceTransformer.encode()` is called **once** per batch of unique strings (lines 210-214), not per (S1, candidate) pair.
+3. Results are stored in `name_emb_map` / `addr_emb_map` dictionaries keyed by normalized string.
+4. During feature extraction, cosine similarity = `np.dot(cached_emb_1, cached_emb_2)` since embeddings are pre-normalized (line 267, 271).
+5. The same approach will be used in Stage 6 inference — encode each unique entity string once, then dot-product across pairs. This is O(N) encoding + O(pairs) dot products, not O(pairs) encoding.
+
 ### What's next
 - Stage 4: Model Training — Train LightGBM binary classifier on cached feature matrix split by S1 entity, calibrate output probabilities (Platt/isotonic), evaluate validation AUC/PR and feature importances, and save model artifacts.
