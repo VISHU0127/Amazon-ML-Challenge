@@ -96,5 +96,57 @@ Top: limited(6318), private(5644), llc(5222), inc(3354), ltd(2484), pvt(1704), s
 - **Throughput**: ~550 S1 entities/second
 - **Output Artifact**: `artifacts/candidate_pairs_eval.tsv` (validated against official TSV schema: PASS)
 
+---
+
+---
+
+## Stage 3 — Feature Engineering (2026-09-25)
+
+### What was built
+- `features.py` — pair-wise feature extraction engine computing 25 discriminative features per (S1, Candidate Target) pair:
+  - **Name Similarity Features (10)**:
+    1. `name_jaro_winkler`: Jaro-Winkler similarity on normalized names
+    2. `name_levenshtein_ratio`: normalized Levenshtein similarity
+    3. `name_token_jaccard`: token intersection / union
+    4. `name_token_overlap_ratio`: token intersection / min(tokens1, tokens2)
+    5. `name_char_3gram_jaccard`: character 3-gram Jaccard similarity
+    6. `name_first_token_soundex_match`: binary phonetic equality on first word
+    7. `name_first_token_metaphone_match`: binary metaphone equality on first word
+    8. `name_acronym_match`: binary flag if acronym of S1 matches Target or vice-versa
+    9. `name_exact_match`: raw or normalized exact match flag
+    10. `name_len_diff`: absolute character length difference
+  - **Legal Suffix Features (3)** (from Stage 1 follow-up):
+    11. `suffix_normalized_equality`: binary flag (1.0 if canonical legal suffixes match, 0.0 if mismatch)
+    12. `suffix_presence_s1`: binary flag if S1 had a recognized legal suffix
+    13. `suffix_presence_target`: binary flag if candidate had a recognized legal suffix
+  - **Address Similarity Features (6)**:
+    14. `addr_token_jaccard`: word token Jaccard similarity of normalized addresses
+    15. `addr_token_overlap_ratio`: word token overlap ratio
+    16. `addr_levenshtein_ratio`: normalized Levenshtein similarity
+    17. `addr_postal_code_match`: 1.0 if postal codes match, 0.0 if both exist and mismatch, 0.5 if either missing
+    18. `addr_street_num_match`: 1.0 if street numbers match, 0.0 if mismatch, 0.5 if either missing
+    19. `addr_is_empty_target`: binary flag indicating missing target address (handles the ~3.4% null rate)
+  - **Meta & Interaction Features (6)**:
+    20. `country_exact_match`: binary flag (1.0 if normalized countries match, 0.0 otherwise) — open vocabulary, not one-hot
+    21. `target_is_s2`: binary source indicator for Source 2
+    22. `target_is_s3`: binary source indicator for Source 3
+    23. `blocking_score`: composite rank fusion score from blocking engine
+    24. `blocking_rank`: candidate rank in retrieved candidate list (1 to 60)
+    25. `name_addr_sim_product`: non-linear interaction term (`name_jaro_winkler * addr_token_overlap_ratio`)
+- `build_feature_matrices.py` — pipeline script generating balanced training and validation matrices using true matches and hard negatives from the blocking stage.
+
+### Feature Matrix Summary
+- **Training Matrix (`artifacts/train_features.npz`)**:
+  - Shape: `(261,434, 25)`
+  - Positives (true matches): **51,763**
+  - Hard Negatives (top non-matches from blocking): **209,671**
+  - Size on disk: 7.11 MB
+- **Validation Matrix (`artifacts/val_features.npz`)**:
+  - Shape: `(88,091, 25)`
+  - Positives: **17,458**
+  - Hard Negatives: **70,633**
+  - Size on disk: 2.40 MB
+- **Metadata**: Saved to `artifacts/feature_summary.json`
+
 ### What's next
-- Stage 3: Feature Engineering (`features.py`) — build pair-wise similarity features (name Jaro-Winkler, Levenshtein, token Jaccard, address similarity, street number & postal code match, `suffix_normalized_equality` flag, source-pair indicators, blocking score features) and cache training/val feature matrices to `artifacts/`.
+- Stage 4: Model Training — Train LightGBM binary classifier on cached feature matrix split by S1 entity, calibrate output probabilities (Platt/isotonic), evaluate validation AUC/PR and feature importances, and save model artifacts.
