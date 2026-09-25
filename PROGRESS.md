@@ -60,5 +60,16 @@ Top: limited(6318), private(5644), llc(5222), inc(3354), ltd(2484), pvt(1704), s
 | `Pune, महाराष्ट्र` | `pune mh` |
 | `##19821 WHEELWRIGHT DR, MONTGOMERY VILLAGE, MD` | `19821 wheelwright dr montgomery village md` |
 
+### French synthetic test results (added post-approval)
+- 27 synthetic French-pattern test cases added: 10 name, 8 address, 6 suffix extraction, 3 postal code
+- **All 27 French cases pass** — normalization degrades gracefully on unseen country
+- French legal forms (SARL, SAS, SA, SCI, EURL) correctly stripped and extracted
+- Accented characters (é, è, ê, ç, ô) correctly stripped from Latin script
+- French regions (Hauts-de-France→hdf, Nouvelle-Aquitaine→naq, Ile-de-France→idf) abbreviate correctly
+- Total test suite: **79/79 passing**
+
+### Stage 3 feature plan note
+- Will include `suffix_normalized_equality` flag as a feature even though core name comparison strips suffixes — suffix mismatches can indicate genuinely different entities and F0.5 penalizes false merges heavily
+
 ### What's next
 - Stage 2: Blocking / candidate generation

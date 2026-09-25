@@ -3,6 +3,7 @@
 Stage 1 — Unit tests for normalize.py
 
 Tests normalization on ~20 hand-picked noisy pairs from training data,
+plus synthetic French-pattern test cases (France has zero training coverage),
 showing before/after transformations.
 """
 
@@ -20,7 +21,7 @@ from normalize import (
 # ═══════════════════════════════════════════════════════════════════════
 
 NAME_TEST_CASES = [
-    # (raw_input, expected_normalized)  — expected is approximate / substring check
+    # (raw_input, expected_normalized)
     # 1. Case folding
     ("DAVIS FAMILY OFFICE", "davis family office"),
     # 2. Legal suffix removal: Inc
@@ -125,6 +126,79 @@ COUNTRY_CASES = [
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SYNTHETIC FRENCH-PATTERN TEST CASES
+# France has zero training coverage — these verify normalization doesn't
+# crash or mis-normalize on French legal suffixes, accented names,
+# address patterns, and region names.
+# ═══════════════════════════════════════════════════════════════════════
+
+FRENCH_NAME_CASES = [
+    # 1. SARL suffix removal
+    ("Boulangerie Dupont SARL", "boulangerie dupont"),
+    # 2. SAS suffix removal
+    ("Créations Lumière S.A.S.", "creations lumiere"),
+    # 3. SCI suffix removal
+    ("SCI Les Jardins de Provence", "les jardins de provence"),
+    # 4. EURL suffix removal
+    ("EURL Petit Atelier", "petit atelier"),
+    # 5. SA suffix removal
+    ("Groupe Financier S.A.", "groupe financier"),
+    # 6. Heavy diacritics in name — all Latin accents should be stripped
+    ("Société Générale des Télécommunications", "societe generale des telecommunications"),
+    # 7. Mixed French suffixes: SAS + group
+    ("Héritiers François Group SAS", "heritiers francois"),
+    # 8. French .fr domain
+    ("www.boulangerie-dupont.fr", "boulangerie-dupont"),
+    # 9. Ampersand in French name
+    ("Pierre & Fils SARL", "pierre and fils"),
+    # 10. Accented characters only in name (no suffix)
+    ("Café René", "cafe rene"),
+]
+
+FRENCH_ADDRESS_CASES = [
+    # 1. Rue with accents and number
+    ("18 Rue Jean Jaurès, Dunkerque, Nord",
+     ["18", "rue", "jean", "jaures", "dunkerque", "nord"]),
+    # 2. Boulevard abbreviation with postal code
+    ("175 Boulevard du Président Roosevelt, 33000 Bordeaux",
+     ["175", "blvd", "du", "president", "roosevelt", "33000", "bordeaux"]),
+    # 3. Hauts-de-France region
+    ("63 Rue de Dieppe, Lille, Hauts-de-France",
+     ["63", "rue", "de", "dieppe", "lille", "hdf"]),
+    # 4. Nouvelle-Aquitaine region
+    ("12 Avenue de la Liberté, Bordeaux, Nouvelle-Aquitaine",
+     ["12", "ave", "de", "la", "liberte", "bordeaux", "naq"]),
+    # 5. Île-de-France region with heavy diacritics
+    ("5 Rue de l'Élysée, Paris, Ile-de-France",
+     ["5", "rue", "de", "lelysee", "paris", "idf"]),
+    # 6. French postal code extraction
+    ("23 Rue Voltaire, 75011 Paris",
+     ["23", "rue", "voltaire", "75011", "paris"]),
+    # 7. Address with cedilla
+    ("Façade Centre Commercial, Strasbourg",
+     ["facade", "centre", "commercial", "strasbourg"]),
+    # 8. Empty address (France entity with missing address)
+    ("", []),
+]
+
+FRENCH_SUFFIX_EXTRACTION_CASES = [
+    ("Boulangerie Dupont SARL", ["sarl"]),
+    ("Créations Lumière S.A.S.", ["sas"]),
+    ("SCI Les Jardins de Provence", ["sci"]),
+    ("Groupe Financier S.A.", ["sa"]),
+    ("EURL Petit Atelier", ["eurl"]),
+    # No legal suffix — should return empty
+    ("Café René", []),
+]
+
+FRENCH_POSTAL_CASES = [
+    ("23 Rue Voltaire, 75011 Paris", "75011"),
+    ("175 Boulevard Roosevelt, 33000 Bordeaux", "33000"),
+    ("Dunkerque, Nord", ""),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # RUN TESTS
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -138,7 +212,7 @@ def run_tests():
     print("=" * 70)
 
     # ── Name tests ──────────────────────────────────────────────────────
-    print("\n── Name normalization ──")
+    print("\n── Name normalization (training-derived) ──")
     for i, (raw, expected) in enumerate(NAME_TEST_CASES, 1):
         total += 1
         result = normalize_name(raw)
@@ -152,7 +226,8 @@ def run_tests():
         print(f"       → [{result}]")
         if not ok:
             print(f"       EXPECTED: [{expected}]")
-    # Also show suffix extraction
+
+    # ── Suffix extraction tests ─────────────────────────────────────────
     print("\n── Legal suffix extraction ──")
     suffix_tests = [
         ("Team Air Pvt. Ltd.", ["ltd", "pvt"]),
@@ -174,12 +249,11 @@ def run_tests():
             print(f"       EXPECTED: {expected_suffixes}")
 
     # ── Address tests ───────────────────────────────────────────────────
-    print("\n── Address normalization ──")
+    print("\n── Address normalization (training-derived) ──")
     for i, (raw, expected_tokens) in enumerate(ADDRESS_TEST_CASES, 1):
         total += 1
         result = normalize_address(raw)
         result_tokens = result.lower().split()
-        # Check all expected tokens are present
         missing = [t for t in expected_tokens if t not in result_tokens]
         ok = len(missing) == 0
         status = "✓" if ok else "✗"
@@ -227,6 +301,73 @@ def run_tests():
     for raw, expected in COUNTRY_CASES:
         total += 1
         result = normalize_country(raw)
+        ok = result == expected
+        status = "✓" if ok else "✗"
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        print(f"  {status} [{raw}] → [{result}]")
+        if not ok:
+            print(f"       EXPECTED: [{expected}]")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # FRENCH SYNTHETIC TEST CASES
+    # ═══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("FRENCH SYNTHETIC TEST CASES (unseen-country graceful degradation)")
+    print("=" * 70)
+
+    print("\n── French name normalization ──")
+    for i, (raw, expected) in enumerate(FRENCH_NAME_CASES, 1):
+        total += 1
+        result = normalize_name(raw)
+        ok = result == expected
+        status = "✓" if ok else "✗"
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        print(f"  {status} {i:2d}. [{raw}]")
+        print(f"       → [{result}]")
+        if not ok:
+            print(f"       EXPECTED: [{expected}]")
+
+    print("\n── French address normalization ──")
+    for i, (raw, expected_tokens) in enumerate(FRENCH_ADDRESS_CASES, 1):
+        total += 1
+        result = normalize_address(raw)
+        result_tokens = result.lower().split()
+        missing = [t for t in expected_tokens if t not in result_tokens]
+        ok = len(missing) == 0
+        status = "✓" if ok else "✗"
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        print(f"  {status} {i:2d}. [{raw}]")
+        print(f"       → [{result}]")
+        if missing:
+            print(f"       MISSING TOKENS: {missing}")
+
+    print("\n── French suffix extraction ──")
+    for raw, expected_suffixes in FRENCH_SUFFIX_EXTRACTION_CASES:
+        total += 1
+        result = extract_legal_suffixes(raw)
+        ok = result == expected_suffixes
+        status = "✓" if ok else "✗"
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        print(f"  {status} [{raw}] → suffixes: {result}")
+        if not ok:
+            print(f"       EXPECTED: {expected_suffixes}")
+
+    print("\n── French postal code extraction ──")
+    for raw, expected in FRENCH_POSTAL_CASES:
+        total += 1
+        result = extract_postal_code(raw)
         ok = result == expected
         status = "✓" if ok else "✗"
         if ok:
