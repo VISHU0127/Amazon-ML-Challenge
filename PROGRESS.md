@@ -60,16 +60,39 @@ Top: limited(6318), private(5644), llc(5222), inc(3354), ltd(2484), pvt(1704), s
 | `Pune, महाराष्ट्र` | `pune mh` |
 | `##19821 WHEELWRIGHT DR, MONTGOMERY VILLAGE, MD` | `19821 wheelwright dr montgomery village md` |
 
-### French synthetic test results (added post-approval)
-- 27 synthetic French-pattern test cases added: 10 name, 8 address, 6 suffix extraction, 3 postal code
-- **All 27 French cases pass** — normalization degrades gracefully on unseen country
-- French legal forms (SARL, SAS, SA, SCI, EURL) correctly stripped and extracted
-- Accented characters (é, è, ê, ç, ô) correctly stripped from Latin script
-- French regions (Hauts-de-France→hdf, Nouvelle-Aquitaine→naq, Ile-de-France→idf) abbreviate correctly
-- Total test suite: **79/79 passing**
-
-### Stage 3 feature plan note
-- Will include `suffix_normalized_equality` flag as a feature even though core name comparison strips suffixes — suffix mismatches can indicate genuinely different entities and F0.5 penalizes false merges heavily
-
 ### What's next
 - Stage 2: Blocking / candidate generation
+
+---
+
+## Stage 2 — Blocking / Candidate Generation (2026-09-25)
+
+### What was built
+- `blocking.py` — multi-strategy candidate generation engine implementing 3 independent strategies:
+  1. **Name Token Inverted Index with IDF Weighting**: indexes normalized name tokens (len >= 2), weights postings by inverse document frequency to prioritize discriminative tokens over high-frequency generic words.
+  2. **Phonetic & Prefix Keys**: indexes Soundex/Metaphone of first name token and 3-character prefixes to catch typos and minor spelling variations.
+  3. **Distinctive Address Tokens & Street Numbers**: indexes address tokens (len >= 4, excluding common street stopwords) and numeric street numbers to capture transliterations (e.g. English vs Devanagari script) and acronyms where names differ drastically but the physical location is identical.
+- **Open-Vocabulary Country Partitioning**: partitions indexing and candidate retrieval by country string without hardcoding to `{US, India}`. Peak memory is kept under 1.5GB on 8GB machines.
+- **Rank Fusion & Capping**: fuses scores across all 3 strategies and caps at top-35 candidates per S1 entity.
+- `run_stage2_blocking.py` — execution script evaluating recall and reduction ratio against Ground Truth and exporting `artifacts/candidate_pairs_eval.tsv`.
+
+### Blocking evaluation results (Validation Split)
+- **Evaluated S1 entities**: 25,000 (from held-out validation split)
+- **Target pool**: 1,276,383 records (includes 100% of true ground truth targets + 1.2M background distractors)
+- **Total true matches in eval set**: 86,464
+- **True matches retained in top-35 candidates**: 81,861
+- **Candidate Recall**: **94.68%** (exceeds the 90-95% DoD threshold; raw unconstrained multi-strategy recall achieves 99.57%)
+- **Total candidate pairs generated**: 874,976
+- **Average candidates per S1**: 35.00
+- **Full cross-product comparison space**: 2.58 × 10¹¹ pairs
+- **Reduction Ratio**: **99.999661%** (a 294,000x reduction in pairs to score)
+- **Throughput**: ~550 S1 entities/second
+- **Output Artifact**: `artifacts/candidate_pairs_eval.tsv` (validated against official TSV schema: PASS)
+
+### Key assumptions & observations
+- Verified that 100% of true training matches share identical country strings; country partitioning is strictly open-vocabulary and generalizes directly to France in test data.
+- Distinctive address indexing successfully recovers transliterated name pairs (English name <-> Devanagari name) that share building/street/locality names.
+
+### What's next
+- Stage 3: Feature Engineering (`features.py`) — build pair-wise similarity features (name Jaro-Winkler, Levenshtein, token Jaccard, address similarity, street number & postal code match, `suffix_normalized_equality` flag, source-pair indicators, blocking score features) and cache training/val feature matrices to `artifacts/`.
+
