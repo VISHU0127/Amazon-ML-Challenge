@@ -100,53 +100,87 @@ Top: limited(6318), private(5644), llc(5222), inc(3354), ltd(2484), pvt(1704), s
 
 ---
 
-## Stage 3 — Feature Engineering (2026-09-25)
+---
+
+## Stage 3 — Feature Engineering & Sanity Audits (2026-09-25)
 
 ### What was built
-- `features.py` — pair-wise feature extraction engine computing 25 discriminative features per (S1, Candidate Target) pair:
-  - **Name Similarity Features (10)**:
+- `features.py` — pair-wise feature extraction engine computing 27 discriminative features per (S1, Candidate Target) pair:
+  - **Name Similarity Features (11)**:
     1. `name_jaro_winkler`: Jaro-Winkler similarity on normalized names
-    2. `name_levenshtein_ratio`: normalized Levenshtein similarity
-    3. `name_token_jaccard`: token intersection / union
-    4. `name_token_overlap_ratio`: token intersection / min(tokens1, tokens2)
-    5. `name_char_3gram_jaccard`: character 3-gram Jaccard similarity
-    6. `name_first_token_soundex_match`: binary phonetic equality on first word
-    7. `name_first_token_metaphone_match`: binary metaphone equality on first word
-    8. `name_acronym_match`: binary flag if acronym of S1 matches Target or vice-versa
-    9. `name_exact_match`: raw or normalized exact match flag
-    10. `name_len_diff`: absolute character length difference
+    2. `name_embedding_cosine`: cosine similarity from multilingual sentence transformer
+    3. `name_levenshtein_ratio`: normalized Levenshtein similarity
+    4. `name_token_jaccard`: token intersection / union
+    5. `name_token_overlap_ratio`: token intersection / min(tokens1, tokens2)
+    6. `name_char_3gram_jaccard`: character 3-gram Jaccard similarity
+    7. `name_first_token_soundex_match`: binary phonetic equality on first word
+    8. `name_first_token_metaphone_match`: binary metaphone equality on first word
+    9. `name_acronym_match`: binary flag if acronym of S1 matches Target or vice-versa
+    10. `name_exact_match`: raw or normalized exact match flag
+    11. `name_len_diff`: absolute character length difference
   - **Legal Suffix Features (3)** (from Stage 1 follow-up):
-    11. `suffix_normalized_equality`: binary flag (1.0 if canonical legal suffixes match, 0.0 if mismatch)
-    12. `suffix_presence_s1`: binary flag if S1 had a recognized legal suffix
-    13. `suffix_presence_target`: binary flag if candidate had a recognized legal suffix
-  - **Address Similarity Features (6)**:
-    14. `addr_token_jaccard`: word token Jaccard similarity of normalized addresses
-    15. `addr_token_overlap_ratio`: word token overlap ratio
-    16. `addr_levenshtein_ratio`: normalized Levenshtein similarity
-    17. `addr_postal_code_match`: 1.0 if postal codes match, 0.0 if both exist and mismatch, 0.5 if either missing
-    18. `addr_street_num_match`: 1.0 if street numbers match, 0.0 if mismatch, 0.5 if either missing
-    19. `addr_is_empty_target`: binary flag indicating missing target address (handles the ~3.4% null rate)
+    12. `suffix_normalized_equality`: binary flag (1.0 if canonical legal suffixes match, 0.0 if mismatch)
+    13. `suffix_presence_s1`: binary flag if S1 had a recognized legal suffix
+    14. `suffix_presence_target`: binary flag if candidate had a recognized legal suffix
+  - **Address Similarity Features (7)**:
+    15. `addr_token_jaccard`: word token Jaccard similarity of normalized addresses
+    16. `addr_token_overlap_ratio`: word token overlap ratio
+    17. `addr_levenshtein_ratio`: normalized Levenshtein similarity
+    18. `addr_embedding_cosine`: semantic cosine similarity of normalized addresses
+    19. `addr_postal_code_match`: 1.0 if postal codes match, 0.0 if both exist and mismatch, 0.5 if either missing
+    20. `addr_street_num_match`: 1.0 if street numbers match, 0.0 if mismatch, 0.5 if either missing
+    21. `addr_is_empty_target`: binary flag indicating missing target address (handles the ~3.4% null rate)
   - **Meta & Interaction Features (6)**:
-    20. `country_exact_match`: binary flag (1.0 if normalized countries match, 0.0 otherwise) — open vocabulary, not one-hot
-    21. `target_is_s2`: binary source indicator for Source 2
-    22. `target_is_s3`: binary source indicator for Source 3
-    23. `blocking_score`: composite rank fusion score from blocking engine
-    24. `blocking_rank`: candidate rank in retrieved candidate list (1 to 60)
-    25. `name_addr_sim_product`: non-linear interaction term (`name_jaro_winkler * addr_token_overlap_ratio`)
-- `build_feature_matrices.py` — pipeline script generating balanced training and validation matrices using true matches and hard negatives from the blocking stage.
+    22. `country_exact_match`: binary flag (1.0 if normalized countries match, 0.0 otherwise) — open vocabulary, not one-hot
+    23. `target_is_s2`: binary source indicator for Source 2
+    24. `target_is_s3`: binary source indicator for Source 3
+    25. `blocking_score`: composite rank fusion score from blocking engine
+    26. `blocking_rank`: candidate rank in retrieved candidate list (1 to 60)
+    27. `name_addr_sim_product`: non-linear interaction term (`name_jaro_winkler * addr_token_overlap_ratio`)
+- **Multilingual Semantic Embeddings**:
+  - Model: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+  - License: **Apache-2.0**
+  - Parameter Count: **117.7M parameters** (strictly <= 8B)
+  - Languages: Multilingual covering 50+ languages including English, French (for unseen test country), and Hindi.
+- `build_feature_matrices.py` — rebuilt against the corrected Stage 2 candidate generation (top-60 cap, hyphen token expansion, cross-country fallback).
+- `sanity_check_features.py` — rigorous automated audit of the generated feature matrices.
 
 ### Feature Matrix Summary
 - **Training Matrix (`artifacts/train_features.npz`)**:
-  - Shape: `(261,434, 25)`
-  - Positives (true matches): **51,763**
-  - Hard Negatives (top non-matches from blocking): **209,671**
-  - Size on disk: 7.11 MB
+  - Shape: `(261,434, 27)`
+  - Positives (true matches): **51,763** (19.8% positive rate)
+  - Hard Negatives (top non-matches from blocking): **209,671** (80.2%)
+  - Size on disk: 8.9 MB
 - **Validation Matrix (`artifacts/val_features.npz`)**:
-  - Shape: `(88,091, 25)`
-  - Positives: **17,458**
-  - Hard Negatives: **70,633**
-  - Size on disk: 2.40 MB
+  - Shape: `(88,091, 27)`
+  - Positives: **17,458** (19.8% positive rate)
+  - Hard Negatives: **70,633** (80.2%)
+  - Size on disk: 3.0 MB
 - **Metadata**: Saved to `artifacts/feature_summary.json`
+
+### Sanity Check Audit Results (All 6 Passed)
+1. **NaN / Inf Audit**: **0 NaNs, 0 Infs** across all 27 columns in both train and val matrices. (PASS)
+2. **Zero-Variance Scan**: Only `country_exact_match` is constant at 1.0 because candidate generation is partitioned by country. All other 26 features exhibit healthy non-zero variance. (PASS)
+3. **Positive vs. Negative Distribution Separation**:
+   - `name_jaro_winkler`: Pos **0.8894** vs Neg **0.6946** (+0.1948)
+   - `name_embedding_cosine`: Pos **0.8465** vs Neg **0.5378** (+0.3088)
+   - `addr_token_jaccard`: Pos **0.7524** vs Neg **0.1201** (+0.6324)
+   - `addr_embedding_cosine`: Pos **0.8755** vs Neg **0.5277** (+0.3478)
+   - `suffix_normalized_equality`: Pos **0.6136** vs Neg **0.2304** (+0.3832)
+   - `name_addr_sim_product`: Pos **0.7777** vs Neg **0.1179** (+0.6597)
+   - All core similarity features show strong, statistically significant positive separation. (PASS)
+4. **Row-Count Reconciliation**: Exactly 261,434 train pairs and 88,091 val pairs matching the candidate blocking sets with 0 duplicate pairs. (PASS)
+5. **Zero-Leakage Audit**: Exactly 0 S1 entity IDs overlap between train (15,000 entities) and val (5,000 entities). (PASS)
+6. **Country & Source Segment Breakdown**:
+   - India positive rate: 19.8% (104,959 pairs)
+   - US positive rate: 19.8% (156,475 pairs)
+   - S1-S2 positive rate: 15.3% (164,814 pairs)
+   - S1-S3 positive rate: 27.5% (96,620 pairs)
+   - Feature means are stable and balanced across segments. (PASS)
+
+### Stage 4 Training Plan Note
+- In Stage 4, `scale_pos_weight` will be explicitly set to `(len(y) - sum(y)) / sum(y) ≈ 4.05` to balance the ~19.8% positive rate so class imbalance does not compound with F0.5's precision bias.
+- Probability calibration (isotonic regression / Platt scaling) will be fitted on the validation split.
 
 ### What's next
 - Stage 4: Model Training — Train LightGBM binary classifier on cached feature matrix split by S1 entity, calibrate output probabilities (Platt/isotonic), evaluate validation AUC/PR and feature importances, and save model artifacts.
