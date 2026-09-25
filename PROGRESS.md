@@ -248,34 +248,6 @@ These entities have name tokens that appear in thousands of target records, caus
 4. During feature extraction, cosine similarity = `np.dot(cached_emb_1, cached_emb_2)` since embeddings are pre-normalized (line 267, 271).
 5. The same approach will be used in Stage 6 inference — encode each unique entity string once, then dot-product across pairs. This is O(N) encoding + O(pairs) dot products, not O(pairs) encoding.
 
-### 4th Strategy Evaluation: Dense Multilingual Embedding Retrieval
-
-**Motivation**: Directly test whether dense ANN retrieval (top-K cosine similarity using `paraphrase-multilingual-MiniLM-L12-v2`) recovers the 645 missed matches from top-60 lexical blocking (and specifically the 459 misses with zero shared name tokens).
-
-1. **Address Blocking Audit on the Not-in-Top-200 Misses**:
-   - Total not-in-top-200 misses analyzed: 159 (sample of 5,000 val S1 entities)
-   - Target has completely empty address (`''`): **1.9%** (3 pairs)
-   - Target has address, but **0 shared address tokens** (4+ chars): **34.0%** (54 pairs)
-   - **Subtotal with zero address overlap signal: 35.8%** (57 pairs) — completely invisible to address blocking
-   - Target shares $\ge 1$ address tokens: **64.2%** (102 pairs) — shared broad locality/city tokens (e.g. "Bangalore", "Sector", "Road", "Delhi") that exceeded the high-frequency posting cap (>3000) or were outranked by hundreds of other entities sharing the same locality.
-
-2. **Dense Multilingual Embedding Cosine Distribution (on 645 misses)**:
-   - Mean cosine: **0.5450**, Median cosine: **0.5264**
-   - **60.2%** have cosine $< 0.60$ (the surface forms are completely different acronyms/abbreviations where dense sentence embeddings assign low similarity)
-   - Only **16.7%** have cosine $\ge 0.85$
-
-3. **Dense ANN Retrieval Recovery Results (competing against 60,000+ target entities)**:
-   - **Top-5 Dense ANN**: Recovers 44 / 264 misses (16.7%) $\rightarrow$ New Recall = **96.51%** (+0.26%)
-   - **Top-10 Dense ANN**: Recovers 55 / 264 misses (20.8%) $\rightarrow$ New Recall = **96.58%** (+0.32%)
-   - **Top-20 Dense ANN**: Recovers 61 / 264 misses (23.1%) $\rightarrow$ New Recall = **96.61%** (+0.35%)
-   - **Top-50 Dense ANN**: Recovers 78 / 264 misses (29.5%) $\rightarrow$ New Recall = **96.71%** (+0.45%)
-   - **Top-100 Dense ANN**: Recovers 90 / 264 misses (34.1%) $\rightarrow$ New Recall = **96.78%** (+0.52%)
-
-4. **Tradeoff & Decision**:
-   - Adding dense retrieval over the full 1.28M target pool requires ~50-80 minutes of offline encoding + heavy vector search at test time, but only yields **+0.35%** recall at Top-20 (from 96.26% to 96.61%).
-   - >75% of missed true matches remain unrecovered because their semantic similarity is low (median 0.526) or generic short names have hundreds of denser distractors.
-   - **Decision**: Rejected as a primary blocking strategy due to negligible yield (+0.35% for 10x compute cost). Retain embeddings in Stage 3 feature space (`name_embedding_cosine`, `addr_embedding_cosine`), where LightGBM can use them selectively without blocking overhead. Documented as an evaluated and rejected approach with empirical evidence.
-
 ---
 
 ## Stage 4 — Model Training & Probability Calibration (2025-09-26)
@@ -293,7 +265,6 @@ These entities have name tokens that appear in thousands of target records, caus
 - **Validation PR-AUC**: **0.9971** (DoD threshold: $\ge 0.85$) — **PASS**
 - **Calibrated Brier Score**: **0.0077** (DoD threshold: $< 0.10$) — **PASS**
 - **Log Loss**: **0.0262**
-- **Raw (Pre-calibration) Metrics**: ROC-AUC 0.9993, PR-AUC 0.9973, Brier 0.0089, Log Loss 0.0309
 
 ### Feature Importance Summary (Ranked by Gain)
 1. `addr_token_overlap_ratio`: **57.48%** gain (1,793 splits)
@@ -310,13 +281,36 @@ These entities have name tokens that appear in thousands of target records, caus
 12. `name_levenshtein_ratio`: **0.89%** gain (3,011 splits)
 13. `suffix_normalized_equality`: **0.61%** gain (801 splits)
 
-*Observation*: All top features align with business logic. Address overlap and composite name-address interactions provide the primary discriminative signal, while multilingual embeddings act as a robust semantic regularizer (ranking #4 and #11 with >7,700 total splits across the ensemble).
+---
 
-### Assumptions & Constraints
-- GBDT remains the primary matcher; embeddings provide complementary dense features.
-- Zero hardcoded country rules maintained; France entities will be evaluated using the exact same feature extraction and GBDT scoring logic.
+## Stage 5 — Decision Layer & Local Evaluation (2025-09-26)
+
+### What was built
+- Implemented `code/business_entity_resolution/src/evaluate_stage5.py` to evaluate the complete decision layer and score predictions with macro-averaged $F_{0.5}$ strictly per Source 1 entity.
+- Conducted deep-dive false positive audit on the `addr_token_overlap_ratio` dominance:
+  - Discovered that 39.6%–44.4% of false positives at $\tau \in [0.70, 0.80]$ arise from co-located distinct businesses sharing identical building/locality addresses.
+  - Analyzed true positives with low name similarity and identified that 85%+ are cross-script matches (English S1 vs Indic target in Kannada, Telugu, Bengali, Tamil) or synthetic pseudonyms (`Umbraquo`, `Brixwex+`).
+  - Added targeted **Co-location Guardrail**: suppresses borderline/low-confidence candidate pairs where names are disjoint Latin text (`JW < 0.40`, `Emb < 0.40`, `Jaccard == 0`) despite high address overlap.
+- Addressed calibration split leakage:
+  - Divided the 5,000 validation S1 entities into a 50/50 split:
+    - **Tuning Split**: 2,500 S1 entities used for threshold grid search ($\tau \in [0.40, 0.95]$) and rule tuning.
+    - **Independent Holdout Split**: 2,500 S1 entities held completely untouched for final unbiased local evaluation.
+- Implemented **Global Conflict Resolution (1-to-1 Target Assignment)**:
+  - Each target entity in $S_2 \cup S_3$ can belong to at most one $S_1$ entity.
+  - Conflicts are resolved globally by maximum calibrated probability.
+
+### Key Metrics & Validation Performance (Independent Holdout: 2,500 S1 Entities)
+- **Local Holdout Macro $F_{0.5}$**: **0.9662** (DoD threshold: $\ge 0.85$) — **PASS**
+  - Exceeds the competition threshold by **+0.1162**.
+- **Singleton Identification Accuracy**: **95.10%** (DoD threshold: $\ge 0.95$) — **PASS**
+  - Correctly avoids false merges on 95.1% of true singletons, scoring a perfect 1.0 on them.
+- **Global 1-to-1 Target Uniqueness**: **100% Enforced** (0 duplicate target assignments across the entire prediction set).
+- **Decision Parameters Locked**:
+  - Operating threshold: $\tau = 0.40$ (paired with isotonic calibration, global 1:1 assignment, and co-location guardrail).
+  - Co-location Guardrail: Enabled.
+  - Global 1:1 Target Assignment: Enabled.
+  - Saved to `artifacts/decision_params.json` and `artifacts/stage5_decision_report.json`.
 
 ### What's next
-- Stage 5: Decision Layer & Local Evaluation — Sweep classification threshold $\tau$ on validation split for macro-averaged $F_{0.5}$ (per S1 entity), test 1-to-many vs 1-to-1 constraint resolution (e.g. Hungarian algorithm / maximum bipartite matching), evaluate singleton accuracy (singleton score = 1.0 vs false merge penalty), and record full validation macro $F_{0.5}$.
-
-
+- Stage 6: Full Inference on Test Set — Run end-to-end pipeline (normalization $\rightarrow$ 3-strategy blocking $\rightarrow$ 27 pair-wise features $\rightarrow$ LightGBM inference $\rightarrow$ isotonic calibration $\rightarrow$ decision layer $\rightarrow$ TSV serialization), producing `output/matching_results.tsv` and `output/candidate_pairs.tsv`.
+- Validate deliverables against `utils/validate_submission.py`.
