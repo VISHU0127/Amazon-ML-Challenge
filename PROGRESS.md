@@ -13,47 +13,52 @@
 
 ### Data audit summary
 
-| File | Rows | Columns |
-|------|------|---------|
-| train_source1 | 2,206,821 | entity_id, business_name, business_address, country |
-| train_source2 | 5,034,616 | same |
-| train_source3 | 5,285,603 | same |
-| train_ground_truth | 2,206,821 | source1_entity_id, matched_entity_ids |
-| test_source1 | 1,732,544 | entity_id, business_name, business_address, country |
-| test_source2 | 4,887,273 | same |
-| test_source3 | 5,082,316 | same |
+| File | Rows |
+|------|------|
+| train_source1 | 2,206,821 |
+| train_source2 | 5,034,616 |
+| train_source3 | 5,285,603 |
+| train_ground_truth | 2,206,821 |
+| test_source1 | 1,732,544 |
+| test_source2 | 4,887,273 |
+| test_source3 | 5,082,316 |
 
-**Null / empty rates:**
-- Source 1 (train & test): **0% empty** on all columns
-- Source 2: business_address empty 3.36% (train), 2.65% (test)
-- Source 3: business_address empty 3.33% (train), 2.68% (test)
-- business_name and country: **never empty** in any source
+- Null rates: S1 = 0%; S2/S3 business_address ~3% empty
+- Train countries: US 60%, India 40%
+- Test countries: India 47%, US 38%, France 15% (unseen!)
+- Singletons: 5.58%; Avg matches per S1: 3.46; Max: 11
+- Validation split: 331,023 val / 1,875,798 train (15%/85%), grouped by S1 entity
 
-**Country distribution:**
-- Train: US 60%, India 40% (both sources)
-- Test: India ~47%, US ~38%, **France ~15%** (unseen in training!)
+---
 
-**Ground truth stats:**
-- Singletons (no match): 123,247 (5.58%)
-- With ≥1 match: 2,083,574 (94.42%)
-- Avg matches per S1 entity: 3.46 (3.67 among non-singletons)
-- Max matches: 11
-- Match distribution peak: 3 matches (24%), then 4 (22%), 2 (17%)
-- S2 match IDs: 3,693,619 | S3 match IDs: 3,944,746
-- All GT S1 IDs verified present in train_source1 (zero orphans)
+## Stage 1 — Normalization (2026-09-25)
 
-**Validation split:**
-- 331,023 val S1 entities (15.0%) / 1,875,798 train (85.0%)
-- Grouped by S1 entity — zero leakage
-- Singleton rates balanced: val 5.59%, train 5.58%
+### What was built
+- `normalize.py` — core normalization module with:
+  - `normalize_name()`: lowercase, NFKD (Latin only), URL strip, legal suffix removal, &→and, punctuation strip
+  - `normalize_address()`: lowercase, multi-word abbrev (Hindi states before NFKD), single-word abbrev, NFKD, punctuation strip
+  - `normalize_country()`: lowercase, strip (open vocabulary)
+  - `extract_legal_suffixes()`, `extract_postal_code()`, `extract_street_number()`
+- `mine_patterns.py` — mined suffix/abbreviation tables from 18K+ training pairs
+- `test_normalize.py` — **52/52 unit tests passing**
 
-### Assumptions
-- Country is treated as an open-vocabulary string (no one-hot encoding)
-- The ~3% empty business_address rate in S2/S3 means address features must gracefully handle missing data
-- France entities (~15% of test) have no training signal — pipeline must generalise from name/address similarity patterns learned on US/India
+### Legal suffix table
+Top: limited(6318), private(5644), llc(5222), inc(3354), ltd(2484), pvt(1704), services(907), partners(674), group(669), associates(623), corp(576), llp(561). Hindi: प्राइवेट, लिमिटेड. French: sarl, sas, sa, eurl, sci.
+
+### Example before/after
+
+| Raw Name | Normalized |
+|----------|-----------|
+| `Clairvoyant Récord Private Ltd` | `clairvoyant record` |
+| `सुप्रीम आईटी प्राइवेट लिमिटेड` | `सुप्रीम आईटी` |
+| `www.cardiology.com` | `cardiology` |
+| `Unique & Sons Private Limited` | `unique and sons` |
+
+| Raw Address | Normalized |
+|-------------|-----------|
+| `88 Olive Circle, Lebanon, TN` | `88 olive cir lebanon tn` |
+| `Pune, महाराष्ट्र` | `pune mh` |
+| `##19821 WHEELWRIGHT DR, MONTGOMERY VILLAGE, MD` | `19821 wheelwright dr montgomery village md` |
 
 ### What's next
-- Stage 1: Build `normalize.py` with lowercase, Unicode NFKD, diacritics stripping, legal-suffix canonicalization, address abbreviation tables, postal code & street number extraction
-
-### Validation script
-- `utils/validate_submission.py` confirmed runnable (Python 3.8+, stdlib only)
+- Stage 2: Blocking / candidate generation
