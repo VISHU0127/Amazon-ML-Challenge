@@ -248,5 +248,34 @@ These entities have name tokens that appear in thousands of target records, caus
 4. During feature extraction, cosine similarity = `np.dot(cached_emb_1, cached_emb_2)` since embeddings are pre-normalized (line 267, 271).
 5. The same approach will be used in Stage 6 inference — encode each unique entity string once, then dot-product across pairs. This is O(N) encoding + O(pairs) dot products, not O(pairs) encoding.
 
+### 4th Strategy Evaluation: Dense Multilingual Embedding Retrieval
+
+**Motivation**: Directly test whether dense ANN retrieval (top-K cosine similarity using `paraphrase-multilingual-MiniLM-L12-v2`) recovers the 645 missed matches from top-60 lexical blocking (and specifically the 459 misses with zero shared name tokens).
+
+1. **Address Blocking Audit on the Not-in-Top-200 Misses**:
+   - Total not-in-top-200 misses analyzed: 159 (sample of 5,000 val S1 entities)
+   - Target has completely empty address (`''`): **1.9%** (3 pairs)
+   - Target has address, but **0 shared address tokens** (4+ chars): **34.0%** (54 pairs)
+   - **Subtotal with zero address overlap signal: 35.8%** (57 pairs) — completely invisible to address blocking
+   - Target shares $\ge 1$ address tokens: **64.2%** (102 pairs) — shared broad locality/city tokens (e.g. "Bangalore", "Sector", "Road", "Delhi") that exceeded the high-frequency posting cap (>3000) or were outranked by hundreds of other entities sharing the same locality.
+
+2. **Dense Multilingual Embedding Cosine Distribution (on 645 misses)**:
+   - Mean cosine: **0.5450**, Median cosine: **0.5264**
+   - **60.2%** have cosine $< 0.60$ (the surface forms are completely different acronyms/abbreviations where dense sentence embeddings assign low similarity)
+   - Only **16.7%** have cosine $\ge 0.85$
+
+3. **Dense ANN Retrieval Recovery Results (competing against 60,000+ target entities)**:
+   - **Top-5 Dense ANN**: Recovers 44 / 264 misses (16.7%) $\rightarrow$ New Recall = **96.51%** (+0.26%)
+   - **Top-10 Dense ANN**: Recovers 55 / 264 misses (20.8%) $\rightarrow$ New Recall = **96.58%** (+0.32%)
+   - **Top-20 Dense ANN**: Recovers 61 / 264 misses (23.1%) $\rightarrow$ New Recall = **96.61%** (+0.35%)
+   - **Top-50 Dense ANN**: Recovers 78 / 264 misses (29.5%) $\rightarrow$ New Recall = **96.71%** (+0.45%)
+   - **Top-100 Dense ANN**: Recovers 90 / 264 misses (34.1%) $\rightarrow$ New Recall = **96.78%** (+0.52%)
+
+4. **Tradeoff & Decision**:
+   - Adding dense retrieval over the full 1.28M target pool requires ~50-80 minutes of offline encoding + heavy vector search at test time, but only yields **+0.35%** recall at Top-20 (from 96.26% to 96.61%).
+   - >75% of missed true matches remain unrecovered because their semantic similarity is low (median 0.526) or generic short names have hundreds of denser distractors.
+   - **Decision**: Rejected as a primary blocking strategy due to negligible yield (+0.35% for 10x compute cost). Retain embeddings in Stage 3 feature space (`name_embedding_cosine`, `addr_embedding_cosine`), where LightGBM can use them selectively without blocking overhead. Documented as an evaluated and rejected approach with empirical evidence.
+
 ### What's next
 - Stage 4: Model Training — Train LightGBM binary classifier on cached feature matrix split by S1 entity, calibrate output probabilities (Platt/isotonic), evaluate validation AUC/PR and feature importances, and save model artifacts.
+
