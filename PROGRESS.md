@@ -276,6 +276,47 @@ These entities have name tokens that appear in thousands of target records, caus
    - >75% of missed true matches remain unrecovered because their semantic similarity is low (median 0.526) or generic short names have hundreds of denser distractors.
    - **Decision**: Rejected as a primary blocking strategy due to negligible yield (+0.35% for 10x compute cost). Retain embeddings in Stage 3 feature space (`name_embedding_cosine`, `addr_embedding_cosine`), where LightGBM can use them selectively without blocking overhead. Documented as an evaluated and rejected approach with empirical evidence.
 
+---
+
+## Stage 4 — Model Training & Probability Calibration (2025-09-26)
+
+### What was built
+- Implemented `code/business_entity_resolution/src/train.py` to train a LightGBM GBDT binary classifier on pair-wise candidate features.
+- Configured class imbalance weighting: `scale_pos_weight = 4.0506` based on training positive rate (51,763 positives / 209,671 hard negatives).
+- Integrated early stopping on validation binary logloss / AUC (50 rounds patience, stopped at iteration 629).
+- Evaluated both Platt scaling (Logistic Regression on logits) and Isotonic Regression on the validation split. Isotonic Regression achieved the lowest Brier score.
+- Model artifacts saved to `artifacts/model.joblib` (4.2 MB) and `artifacts/calibrator.joblib`.
+- Feature importances and metrics saved to `artifacts/feature_importances.json` and `artifacts/stage4_training_metrics.json`.
+
+### Key Metrics & Validation Performance
+- **Validation ROC-AUC**: **0.9993** (DoD threshold: $\ge 0.95$) — **PASS**
+- **Validation PR-AUC**: **0.9971** (DoD threshold: $\ge 0.85$) — **PASS**
+- **Calibrated Brier Score**: **0.0077** (DoD threshold: $< 0.10$) — **PASS**
+- **Log Loss**: **0.0262**
+- **Raw (Pre-calibration) Metrics**: ROC-AUC 0.9993, PR-AUC 0.9973, Brier 0.0089, Log Loss 0.0309
+
+### Feature Importance Summary (Ranked by Gain)
+1. `addr_token_overlap_ratio`: **57.48%** gain (1,793 splits)
+2. `name_addr_sim_product`: **15.52%** gain (2,474 splits)
+3. `addr_is_empty_target`: **5.60%** gain (88 splits)
+4. `name_embedding_cosine`: **3.75%** gain (4,414 splits — highest split count, strong regularizer)
+5. `blocking_score`: **3.27%** gain (2,856 splits)
+6. `addr_levenshtein_ratio`: **2.58%** gain (3,863 splits)
+7. `name_jaro_winkler`: **1.83%** gain (3,023 splits)
+8. `addr_token_jaccard`: **1.72%** gain (2,685 splits)
+9. `addr_street_num_match`: **1.21%** gain (890 splits)
+10. `name_char_3gram_jaccard`: **1.21%** gain (2,066 splits)
+11. `addr_embedding_cosine`: **1.04%** gain (3,364 splits)
+12. `name_levenshtein_ratio`: **0.89%** gain (3,011 splits)
+13. `suffix_normalized_equality`: **0.61%** gain (801 splits)
+
+*Observation*: All top features align with business logic. Address overlap and composite name-address interactions provide the primary discriminative signal, while multilingual embeddings act as a robust semantic regularizer (ranking #4 and #11 with >7,700 total splits across the ensemble).
+
+### Assumptions & Constraints
+- GBDT remains the primary matcher; embeddings provide complementary dense features.
+- Zero hardcoded country rules maintained; France entities will be evaluated using the exact same feature extraction and GBDT scoring logic.
+
 ### What's next
-- Stage 4: Model Training — Train LightGBM binary classifier on cached feature matrix split by S1 entity, calibrate output probabilities (Platt/isotonic), evaluate validation AUC/PR and feature importances, and save model artifacts.
+- Stage 5: Decision Layer & Local Evaluation — Sweep classification threshold $\tau$ on validation split for macro-averaged $F_{0.5}$ (per S1 entity), test 1-to-many vs 1-to-1 constraint resolution (e.g. Hungarian algorithm / maximum bipartite matching), evaluate singleton accuracy (singleton score = 1.0 vs false merge penalty), and record full validation macro $F_{0.5}$.
+
 
