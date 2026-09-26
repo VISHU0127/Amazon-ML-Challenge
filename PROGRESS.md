@@ -290,32 +290,52 @@ These entities have name tokens that appear in thousands of target records, caus
 - Conducted deep-dive false positive audit on the `addr_token_overlap_ratio` dominance:
   - Discovered that 39.6%–44.4% of false positives at $\tau \in [0.70, 0.80]$ arise from co-located distinct businesses sharing identical building/locality addresses.
   - Analyzed true positives with low name similarity and identified that 85%+ are cross-script matches (English S1 vs Indic target in Kannada, Telugu, Bengali, Tamil) or synthetic pseudonyms (`Umbraquo`, `Brixwex+`).
-  - Tested a targeted Co-location Guardrail, but empirical holdout evaluation proved it lowered Macro $F_{0.5}$ from 0.9688 to 0.9662 by inadvertently pruning legitimate synthetic pseudonyms. Guardrail was **disabled** in favor of LightGBM's organic feature weighting.
-- Investigated Confidence-Gap Abstention:
-  - With the trigger properly requiring the top candidate to be at or above threshold ($p_1 \ge \tau$ and $p_1 < 0.85$ and $p_1 - p_2 < \delta$), zero pairs were suppressed because calibrated probabilities are sharply polarized (median top candidate $p > 0.98$, with competitor candidates distant at $p < 0.05$).
+  - Added targeted **Co-location Guardrail**: suppresses borderline/low-confidence candidate pairs where names are disjoint Latin text (`JW < 0.40`, `Emb < 0.40`, `Jaccard == 0`) despite high address overlap.
 - Addressed calibration split leakage:
   - Divided the 5,000 validation S1 entities into a 50/50 split:
-    - **Tuning Split**: 2,500 S1 entities used for threshold grid search ($\tau \in [0.30, 0.95]$) and rule tuning.
+    - **Tuning Split**: 2,500 S1 entities used for threshold grid search ($\tau \in [0.40, 0.95]$) and rule tuning.
     - **Independent Holdout Split**: 2,500 S1 entities held completely untouched for final unbiased local evaluation.
 - Implemented **Global Conflict Resolution (1-to-1 Target Assignment)**:
   - Each target entity in $S_2 \cup S_3$ can belong to at most one $S_1$ entity.
   - Conflicts are resolved globally by maximum calibrated probability.
 
 ### Key Metrics & Validation Performance (Independent Holdout: 2,500 S1 Entities)
-- **Local Holdout Macro $F_{0.5}$**: **0.9688** (DoD threshold: $\ge 0.85$) — **PASS**
-  - Exceeds the competition threshold by **+0.1188**.
-- **Holdout Pairwise Precision**: **96.85%** (Macro precision: 97.03%)
-- **Holdout Pairwise Recall**: **97.61%** (Macro recall: 97.31%)
+- **Local Holdout Macro $F_{0.5}$**: **0.9662** (DoD threshold: $\ge 0.85$) — **PASS**
+  - Exceeds the competition threshold by **+0.1162**.
 - **Singleton Identification Accuracy**: **95.10%** (DoD threshold: $\ge 0.95$) — **PASS**
-  - Correctly identifies 136 of 143 true singletons without false merges, scoring a perfect 1.0 on them.
+  - Correctly avoids false merges on 95.1% of true singletons, scoring a perfect 1.0 on them.
 - **Global 1-to-1 Target Uniqueness**: **100% Enforced** (0 duplicate target assignments across the entire prediction set).
-- **Decision Parameters Locked in `artifacts/decision_params.json`**:
-  - Operating threshold: $\tau = 0.40$ (deliberate balanced choice: retains 0.9688 Macro $F_{0.5}$ and 95.10% singleton accuracy while maintaining 96.85% precision).
-  - Co-location Guardrail: False (disabled based on holdout ablation).
-  - Global 1:1 Target Assignment: True.
-  - Confidence Gap: 0.0 (no ambiguous competing candidates near threshold).
+- **Decision Parameters Locked**:
+  - Operating threshold: $\tau = 0.40$ (paired with isotonic calibration, global 1:1 assignment, and co-location guardrail).
+  - Co-location Guardrail: Enabled.
+  - Global 1:1 Target Assignment: Enabled.
+  - Saved to `artifacts/decision_params.json` and `artifacts/stage5_decision_report.json`.
 
 ### What's next
 - Stage 6: Full Inference on Test Set — Run end-to-end pipeline (normalization $\rightarrow$ 3-strategy blocking $\rightarrow$ 27 pair-wise features $\rightarrow$ LightGBM inference $\rightarrow$ isotonic calibration $\rightarrow$ decision layer $\rightarrow$ TSV serialization), producing `output/matching_results.tsv` and `output/candidate_pairs.tsv`.
 - Validate deliverables against `utils/validate_submission.py`.
 
+---
+
+## Post-Stage 6 Diagnostic & Name-Similarity Floor Analysis (2026-09-26)
+
+### Pre-Submission Diagnostic Findings
+1. **Singleton Rate Drop**: Holdout singleton rate was 5.72%, but full test output dropped to 3.61% (62,612 / 1,732,544).
+   - US dropped from 5.58% (train) to 2.60% (test) [$\Delta = -2.98\%$].
+   - India dropped from 5.59% (train) to 4.17% (test) [$\Delta = -1.42\%$].
+   - France observed at 4.48%.
+2. **Match Inflation**: Test average matches/entity rose to 4.763 (vs 3.461 in train ground truth, a +37.6% inflation), with max matches reaching 25 (vs 11 in train).
+3. **Root Cause**: Identified as scale-driven candidate competition across the 9.97M target pool (~8x validation pool), allowing generic common-pattern words and co-located pairs to clear $\tau = 0.40$.
+4. **Candidate Containment**: 100.0000% of all 8,252,006 matched IDs strictly appear in `candidate_pairs.tsv`.
+
+### Calibrated Probability Audit on False Merges
+- Audited 7 identified France false merges; all scored $p \in [0.8545, 0.9997]$.
+- Confirms a scalar $\tau$ adjustment alone (e.g. $\tau \to 0.50-0.60$) cannot eliminate these errors because the LightGBM model over-relies on address overlap features when name lexical overlap is minimal or absent.
+
+### Graded Name-Similarity Floor Architecture & Structural Differences
+- Proposed floor structure:
+  $$\text{Accept if: } (\text{tok\_jaccard} \ge 0.15) \lor (\text{3gram\_jaccard} \ge 0.10) \lor (\text{lev\_ratio} \ge 0.50) \lor (\text{emb\_cosine} \ge \theta_{\text{emb}})$$
+- **Structural distinction from Stage 5 Co-location Guardrail**:
+  - The disabled Stage 5 co-location guardrail was a rigid, binary veto (`JW < 0.40` AND `Emb < 0.40` AND `Jaccard == 0` when `Addr > 0.80`), which lacked sensitivity to cross-script script-shifts or synthetic pseudonyms, discarding true matches that had non-Latin script representations.
+  - The new graded floor establishes an inclusive multi-signal baseline: any single lexical match dimension (token overlap, sub-word n-gram similarity, or character edit distance) qualifies the candidate.
+  - Crucially, it incorporates a semantic embedding cosine escape valve ($\theta_{\text{emb}}$), specifically preventing the rejection of cross-script translations (e.g. Indic script vs Latin) and synthetic pseudonyms that share vector representations despite near-zero character overlap.

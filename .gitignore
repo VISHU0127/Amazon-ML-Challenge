@@ -1,6 +1,9 @@
 # Data files (too large for git)
 dataset/
 *.tsv
+*.zip
+output/
+scratch/
 
 # Artifacts (models, feature matrices — regenerable)
 artifacts/
