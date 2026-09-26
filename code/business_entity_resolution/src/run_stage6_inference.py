@@ -14,9 +14,8 @@ Pipeline steps per country partition (France, US, India):
 4. Extract 27 pairwise discriminative features for all candidate pairs.
 5. Predict with trained LightGBM GBDT classifier and apply isotonic probability calibration.
 6. Decision Layer:
-   - Operating threshold: tau = 0.40
-   - Confidence-gap abstention backstop (gap = 0.05 for borderline p < 0.85)
-   - Global 1-to-1 target assignment (greedy maximum-weight bipartite matching)
+   - Load threshold, confidence gap, street/name gates and budgets from decision_params.json
+   - Global target uniqueness (each target assigned to at most one S1)
 7. Serialize deliverables:
    - output/candidate_pairs.tsv (blocking candidates per S1)
    - output/matching_results.tsv (final resolved matches per S1)
@@ -68,9 +67,10 @@ from normalize import (
     normalize_name,
 )
 
-BATCH_SIZE = 25000
-TAU = 0.40
-CONFIDENCE_GAP = 0.05
+from embeddings import EmbeddingCache, embedding_cosine
+from decision import load_decision_params, calibrated_probabilities, qualify_pairs, resolve_pairs
+
+BATCH_SIZE = 500
 
 
 def run_country_inference(
@@ -82,6 +82,9 @@ def run_country_inference(
     calibrator,
     cand_out_file,
     match_out_file,
+    embedding_cache,
+    decision_params,
+    candidate_input=None,
 ) -> Tuple[int, int, int]:
     """
     Runs candidate blocking, feature extraction, scoring, decisioning, and writing
@@ -139,50 +142,52 @@ def run_country_inference(
         }
     print(f"Normalized {n_targets:,} targets in {time.time() - t_tgt0:.1f}s.")
 
-    # 2. Build blocking engine
-    print(f"Building CountryBlockingEngine for {country_norm} (top_k=60)...")
-    t_blk0 = time.time()
-    engine = CountryBlockingEngine(country=country_norm, top_k=60)
-    engine.n_target_docs = n_targets
-    engine.target_ids = target_ids
+    engine = None
+    if candidate_input is None:
+        # 2. Build blocking engine
+        print(f"Building CountryBlockingEngine for {country_norm} (top_k=60)...")
+        t_blk0 = time.time()
+        engine = CountryBlockingEngine(country=country_norm, top_k=60)
+        engine.n_target_docs = n_targets
+        engine.target_ids = target_ids
 
-    for idx in range(n_targets):
-        nn = norm_names_tgt[idx]
-        na = norm_addrs_tgt[idx]
-        sn = street_nums_tgt[idx]
+        for idx in range(n_targets):
+            nn = norm_names_tgt[idx]
+            na = norm_addrs_tgt[idx]
+            sn = street_nums_tgt[idx]
 
-        # 1. Name tokens
-        toks = _extract_all_name_tokens(nn)
-        for tok in toks:
-            engine.name_token_idx[tok].append(idx)
+            # 1. Name tokens
+            toks = _extract_all_name_tokens(nn)
+            for tok in toks:
+                engine.name_token_idx[tok].append(idx)
 
-        # 2. Phonetic & Prefix
-        words = nn.split()
-        if words:
-            ft = words[0]
-            try:
-                sx = jellyfish.soundex(ft)
-                engine.phonetic_idx[sx].append(idx)
-            except Exception:
-                pass
-            if len(nn) >= 3:
-                engine.prefix_idx[nn[:3]].append(idx)
+            # 2. Phonetic & Prefix
+            words = nn.split()
+            if words:
+                ft = words[0]
+                try:
+                    sx = jellyfish.soundex(ft)
+                    engine.phonetic_idx[sx].append(idx)
+                except Exception:
+                    pass
+                if len(nn) >= 3:
+                    engine.prefix_idx[nn[:3]].append(idx)
 
-        # 3. Address tokens & street number
-        atoks = na.split()
-        for at in set(atoks):
-            if len(at) >= 4 and at not in COMMON_ADDR_STOPWORDS:
-                engine.addr_token_idx[at].append(idx)
-        if sn and sn.isdigit() and len(sn) >= 2:
-            engine.street_num_idx[sn].append(idx)
+            # 3. Address tokens & street number
+            atoks = na.split()
+            for at in set(atoks):
+                if len(at) >= 4 and at not in COMMON_ADDR_STOPWORDS:
+                    engine.addr_token_idx[at].append(idx)
+            if sn and sn.isdigit() and len(sn) >= 2:
+                engine.street_num_idx[sn].append(idx)
 
-    # Compute IDFs
-    for k, postings in engine.name_token_idx.items():
-        engine.name_idf[k] = math.log((engine.n_target_docs + 1) / (len(postings) + 1)) + 1.0
-    for k, postings in engine.addr_token_idx.items():
-        engine.addr_idf[k] = math.log((engine.n_target_docs + 1) / (len(postings) + 1)) + 1.0
+        # Compute IDFs
+        for k, postings in engine.name_token_idx.items():
+            engine.name_idf[k] = math.log((engine.n_target_docs + 1) / (len(postings) + 1)) + 1.0
+        for k, postings in engine.addr_token_idx.items():
+            engine.addr_idf[k] = math.log((engine.n_target_docs + 1) / (len(postings) + 1)) + 1.0
 
-    print(f"Blocking index built in {time.time() - t_blk0:.1f}s.")
+        print(f"Blocking index built in {time.time() - t_blk0:.1f}s.")
 
     del target_df, norm_names_tgt, norm_addrs_tgt, street_nums_tgt
     gc.collect()
@@ -224,6 +229,8 @@ def run_country_inference(
     candidate_matches_above_tau: List[Tuple[str, str, float]] = []
     n_batches = (n_s1 + BATCH_SIZE - 1) // BATCH_SIZE
 
+    cached_rows = iter_cached_candidates(candidate_input, set(s1_ids)) if candidate_input else None
+
     feature_col_names = FEATURE_NAMES
     n_features = len(feature_col_names)
 
@@ -238,11 +245,20 @@ def run_country_inference(
 
         for sid in batch_s1_ids:
             s_info = s1_cache[sid]
-            cands = engine.query_entity(
-                norm_name=s_info["norm_name"],
-                norm_addr=s_info["norm_addr"],
-                street_num=s_info["street_num"],
-            )
+            if cached_rows is not None:
+                cached_sid, cands = next(cached_rows)
+                if cached_sid != sid:
+                    raise ValueError(f"Cached candidate order mismatch: {cached_sid} != {sid}")
+                if len(cands) > 60 or len(cands) != len(set(cands)):
+                    raise ValueError(f"Invalid cached candidates for {sid}")
+                if any(tid not in target_cache for tid in cands):
+                    raise ValueError(f"Cached candidate outside target country for {sid}")
+            else:
+                cands = engine.query_entity(
+                    norm_name=s_info["norm_name"],
+                    norm_addr=s_info["norm_addr"],
+                    street_num=s_info["street_num"],
+                )
             total_candidates_count += len(cands)
 
             # Write immediately to candidate_pairs file
@@ -255,6 +271,14 @@ def run_country_inference(
 
         if not batch_pairs:
             continue
+
+        # Encode each distinct normalized candidate string once, reusing disk cache
+        # across batches/countries. This is the same encoder and cosine as training.
+        strings = set()
+        for sid, tid, _, _ in batch_pairs:
+            for info in (s1_cache[sid], target_cache[tid]):
+                strings.update((info["norm_name"], info["norm_addr"]))
+        vectors = embedding_cache.get_many(strings)
 
         # Step 4b: Extract features for batch
         n_pairs = len(batch_pairs)
@@ -274,8 +298,8 @@ def run_country_inference(
                 target_id=tid,
                 blocking_score=b_score,
                 blocking_rank=b_rank,
-                name_emb_cosine=0.0,
-                addr_emb_cosine=0.0,
+                name_emb_cosine=embedding_cosine(vectors.get(s1_c["norm_name"]), vectors.get(tgt_c["norm_name"])),
+                addr_emb_cosine=embedding_cosine(vectors.get(s1_c["norm_addr"]), vectors.get(tgt_c["norm_addr"])),
                 s1_norm_name=s1_c["norm_name"],
                 s1_norm_addr=s1_c["norm_addr"],
                 s1_norm_country=s1_c["norm_country"],
@@ -289,56 +313,26 @@ def run_country_inference(
                 t_postal_code=tgt_c["postal_code"],
                 t_suffixes=tgt_c["suffixes"],
             )
-            # High-fidelity proxy for embeddings: name_jw and addr_overlap
-            fdict["name_embedding_cosine"] = fdict["name_jaro_winkler"]
-            fdict["addr_embedding_cosine"] = fdict["addr_token_overlap_ratio"]
-
             for col_i, col_name in enumerate(feature_col_names):
                 X_batch[p_idx, col_i] = fdict[col_name]
 
-        # Step 4c: Predict calibrated probabilities
-        raw_probs = model.predict_proba(X_batch)[:, 1]
-        cal_probs = calibrator.predict(raw_probs)
-
-        # Step 4d: Group by S1 entity and apply confidence-gap backstop
-        sid_cand_probs = defaultdict(list)
-        for p_idx, (sid, tid, _, _) in enumerate(batch_pairs):
-            p = float(cal_probs[p_idx])
-            sid_cand_probs[sid].append((tid, p))
-
-        for sid, cand_list in sid_cand_probs.items():
-            if not cand_list:
-                continue
-
-            # Sort descending by probability
-            cand_list.sort(key=lambda x: x[1], reverse=True)
-
-            # Defensive Confidence-Gap Backstop:
-            # If top candidate is borderline (p < 0.85) and runner-up is within CONFIDENCE_GAP, abstain
-            if CONFIDENCE_GAP > 0 and len(cand_list) >= 2:
-                top_p = cand_list[0][1]
-                sec_p = cand_list[1][1]
-                if top_p < 0.85 and (top_p - sec_p) < CONFIDENCE_GAP:
-                    continue
-
-            for tid, p in cand_list:
-                if p >= TAU:
-                    candidate_matches_above_tau.append((sid, tid, p))
+        # Shared calibration and locked decision logic, also used by diagnostics.
+        cal_probs = calibrated_probabilities(model, calibrator, X_batch)
+        candidate_matches_above_tau.extend(qualify_pairs(
+            batch_pairs, X_batch, cal_probs, s1_cache, target_cache,
+            decision_params, feature_col_names))
+        del vectors, strings, X_batch
 
         elapsed_b = time.time() - t_b0
         if (b_idx + 1) % 4 == 0 or (b_idx + 1) == n_batches:
             print(f"  Batch {b_idx + 1}/{n_batches} ({b_end:,}/{n_s1:,} S1) processed in {elapsed_b:.1f}s | Qualified matches: {len(candidate_matches_above_tau):,}")
 
+    if cached_rows is not None and next(cached_rows, None) is not None:
+        raise ValueError("Extra cached candidate rows in country")
+
     # 5. Global 1-to-1 Target Conflict Resolution
     print(f"\nResolving 1-to-1 target uniqueness among {len(candidate_matches_above_tau):,} qualified pairs for {country_name}...")
-    candidate_matches_above_tau.sort(key=lambda x: x[2], reverse=True)
-    claimed_targets: Set[str] = set()
-    s1_to_final_matches: Dict[str, List[str]] = defaultdict(list)
-
-    for sid, tid, prob in candidate_matches_above_tau:
-        if tid not in claimed_targets:
-            s1_to_final_matches[sid].append(tid)
-            claimed_targets.add(tid)
+    s1_to_final_matches = resolve_pairs(candidate_matches_above_tau, decision_params)
 
     # 6. Stream matching results for all S1 entities of this country
     print(f"Writing matching results for {n_s1:,} {country_name} S1 entities...")
@@ -354,7 +348,7 @@ def run_country_inference(
     match_out_file.flush()
 
     # Free memory
-    del engine, target_cache, s1_cache, candidate_matches_above_tau, claimed_targets, s1_to_final_matches
+    del engine, target_cache, s1_cache, candidate_matches_above_tau, s1_to_final_matches
     gc.collect()
 
     country_elapsed = time.time() - t_c0
@@ -362,13 +356,28 @@ def run_country_inference(
     return n_s1, total_candidates_count, total_matches_count
 
 
-def main():
+def iter_cached_candidates(path, source_ids):
+    """Reuse existing ordered top-60 lists without rebuilding blocking indexes."""
+    with open(path, encoding="utf-8") as handle:
+        if handle.readline().rstrip("\n") != "source1_entity_id\tcandidate_entity_ids":
+            raise ValueError("Unexpected cached candidate header")
+        for line in handle:
+            sid, values = line.rstrip("\n").split("\t")
+            if sid in source_ids:
+                yield sid, values.split(",") if values else []
+
+
+def main(output_dir=OUTPUT_DIR, candidate_input=None):
     t_start = time.time()
     print("=" * 80)
     print("STAGE 6 — FULL INFERENCE ON REAL TEST DATASET")
     print("=" * 80)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    candidate_path = os.path.join(output_dir, "candidate_pairs.tsv")
+    matching_path = os.path.join(output_dir, "matching_results.tsv")
+    if candidate_input and os.path.realpath(candidate_input) == os.path.realpath(candidate_path):
+        raise ValueError("Cached candidate input cannot be the output file")
     model_path = os.path.join(ARTIFACTS_DIR, "model.joblib")
     calibrator_path = os.path.join(ARTIFACTS_DIR, "calibrator.joblib")
 
@@ -376,14 +385,16 @@ def main():
     model = joblib.load(model_path)
     print(f"Loading probability calibrator from {calibrator_path}...")
     cal_info = joblib.load(calibrator_path)
-    calibrator = cal_info["calibrator"]
+    decision_params = load_decision_params()
+    print("Loaded locked decision parameters:", json.dumps(decision_params, sort_keys=True))
+    embedding_cache = EmbeddingCache(os.path.join(ARTIFACTS_DIR, "minilm_embeddings.sqlite"))
 
     # Open output files with exact competition headers
-    print(f"Initializing output files:\n  {CANDIDATE_PAIRS}\n  {MATCHING_RESULTS}")
-    cand_f = open(CANDIDATE_PAIRS, "w", encoding="utf-8")
+    print(f"Initializing output files:\n  {candidate_path}\n  {matching_path}")
+    cand_f = open(candidate_path, "w", encoding="utf-8")
     cand_f.write("source1_entity_id\tcandidate_entity_ids\n")
 
-    match_f = open(MATCHING_RESULTS, "w", encoding="utf-8")
+    match_f = open(matching_path, "w", encoding="utf-8")
     match_f.write("source1_entity_id\tmatched_entity_ids\n")
 
     # Load test source datasets
@@ -397,15 +408,18 @@ def main():
     print(f"  test_source2: {len(s2_all):,} rows")
     print(f"  test_source3: {len(s3_all):,} rows")
 
-    countries = ["France", "US", "India"]
+    # Country partitions are data-derived; decision rules come from JSON.
+    for frame in (s1_all, s2_all, s3_all):
+        frame["_norm_country"] = frame[COL_COUNTRY].map(normalize_country)
+    countries = sorted(s1_all["_norm_country"].unique())
     total_processed_s1 = 0
     total_cand_count = 0
     total_match_count = 0
 
     for country in countries:
-        s1_c = s1_all[s1_all[COL_COUNTRY] == country].copy()
-        s2_c = s2_all[s2_all[COL_COUNTRY] == country].copy()
-        s3_c = s3_all[s3_all[COL_COUNTRY] == country].copy()
+        s1_c = s1_all[s1_all["_norm_country"] == country].copy()
+        s2_c = s2_all[s2_all["_norm_country"] == country].copy()
+        s3_c = s3_all[s3_all["_norm_country"] == country].copy()
 
         n_s1, n_cand, n_match = run_country_inference(
             country_name=country,
@@ -413,9 +427,12 @@ def main():
             s2_sub_df=s2_c,
             s3_sub_df=s3_c,
             model=model,
-            calibrator=calibrator,
+            calibrator=cal_info,
             cand_out_file=cand_f,
             match_out_file=match_f,
+            embedding_cache=embedding_cache,
+            decision_params=decision_params,
+            candidate_input=candidate_input,
         )
         total_processed_s1 += n_s1
         total_cand_count += n_cand
@@ -424,6 +441,7 @@ def main():
         del s1_c, s2_c, s3_c
         gc.collect()
 
+    embedding_cache.close()
     cand_f.close()
     match_f.close()
 
@@ -435,8 +453,8 @@ def main():
     print(f"Total Candidates generated:  {total_cand_count:,}")
     print(f"Total Matches predicted:     {total_match_count:,}")
     print(f"Total Elapsed Time:          {total_time/60:.1f} minutes ({total_time:.1f}s)")
-    print(f"Output matching results:     {MATCHING_RESULTS}")
-    print(f"Output candidate pairs:      {CANDIDATE_PAIRS}")
+    print(f"Output matching results:     {matching_path}")
+    print(f"Output candidate pairs:      {candidate_path}")
 
     # Validate deliverables against official validation script
     print("\n" + "=" * 80)
@@ -444,8 +462,8 @@ def main():
     print("=" * 80)
     from utils.validate_submission import validate
     errors, warnings = validate(
-        matching_path=MATCHING_RESULTS,
-        candidate_path=CANDIDATE_PAIRS,
+        matching_path=matching_path,
+        candidate_path=candidate_path,
         test_dir=TEST_DIR,
         check_ids=False,
     )
@@ -465,4 +483,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    parser.add_argument("--candidate-input")
+    args = parser.parse_args()
+    main(args.output_dir, args.candidate_input)

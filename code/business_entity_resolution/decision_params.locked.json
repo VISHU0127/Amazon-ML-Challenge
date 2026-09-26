@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "provenance": "Locked rules restored from fc81ef2:Documentation_template.md section 4.3; not retuned for embedding repair",
+  "optimal_threshold": 0.6,
+  "colocation_guard": false,
+  "global_uniqueness": true,
+  "confidence_gap": 0.05,
+  "confidence_ceiling": 0.85,
+  "street_number_gate": {
+    "enabled": true,
+    "max_difference": 1
+  },
+  "name_floor": {
+    "enabled": true,
+    "indic_pattern": "[\\u0900-\\u0D7F]",
+    "indic_jaro_winkler_min": 0.3,
+    "token_overlap_min": 0.5,
+    "levenshtein_min": 0.5,
+    "levenshtein_alternative_min": 0.75
+  },
+  "budget_caps": {
+    "S2": 5,
+    "S3": 6,
+    "total": 11
+  }
+}

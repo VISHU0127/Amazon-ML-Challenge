@@ -47,7 +47,7 @@ from normalize import (
     normalize_name,
 )
 
-EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+from embeddings import EMBEDDING_MODEL_NAME, load_embedding_model, encode_unique, embedding_cosine
 EMBEDDING_MODEL_LICENSE = "Apache-2.0"
 EMBEDDING_MODEL_PARAMS = 117653760
 
@@ -201,21 +201,18 @@ def build_and_cache_datasets(
 
     print(f"Computing Multilingual Embeddings for {len(unique_names):,} unique names and {len(unique_addrs):,} unique addresses...")
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    emb_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
+    emb_model = load_embedding_model(device)
 
     t_emb0 = time.time()
     name_list = list(unique_names)
     addr_list = list(unique_addrs)
 
-    name_embs = emb_model.encode(name_list, batch_size=512, normalize_embeddings=True, show_progress_bar=True)
-    name_emb_map = {name_list[i]: name_embs[i] for i in range(len(name_list))}
-
-    addr_embs = emb_model.encode(addr_list, batch_size=512, normalize_embeddings=True, show_progress_bar=True)
-    addr_emb_map = {addr_list[i]: addr_embs[i] for i in range(len(addr_list))}
+    name_emb_map = encode_unique(emb_model, name_list)
+    addr_emb_map = encode_unique(emb_model, addr_list)
     print(f"Embeddings generated in {time.time() - t_emb0:.1f}s on {device}.")
 
     # Free embedding model from memory
-    del emb_model, name_embs, addr_embs
+    del emb_model
     gc.collect()
 
     # 8. Feature Matrix Extraction function with embeddings
@@ -262,13 +259,8 @@ def build_and_cache_datasets(
             tgt_c = tgt_cache[tid]
 
             # Cosine similarities
-            name_cos = 0.0
-            if s1_c["name_emb"] is not None and tgt_c["name_emb"] is not None:
-                name_cos = float(np.dot(s1_c["name_emb"], tgt_c["name_emb"]))
-
-            addr_cos = 0.0
-            if s1_c["addr_emb"] is not None and tgt_c["addr_emb"] is not None:
-                addr_cos = float(np.dot(s1_c["addr_emb"], tgt_c["addr_emb"]))
+            name_cos = embedding_cosine(s1_c["name_emb"], tgt_c["name_emb"])
+            addr_cos = embedding_cosine(s1_c["addr_emb"], tgt_c["addr_emb"])
 
             fdict = extract_pair_features(
                 s1_name_raw=s1_c["raw_name"],
